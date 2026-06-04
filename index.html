@@ -1,329 +1,885 @@
-/**
- * TalentPool ATS — Google Apps Script backend
- * Bound to your OPERATIONAL spreadsheet (the one holding the "Candidate" tab).
- *
- * Actions:
- *   login            -> reads username / password / role from a SEPARATE Auth spreadsheet (by ID)
- *   read/create/update/delete -> generic CRUD (maps by Row-1 headers)
- *   parseResume      -> Gemini extracts structured candidate fields from a resume file
- *   scoreResume      -> Gemini scores & ranks a resume against a job description (AI shortlisting)
- *   generateKit      -> Gemini builds role-based screening questions + a structured scorecard
- *   uploadResume     -> stores the file in Drive, returns a shareable link
- *
- * SECURITY: the Gemini key lives here, on the server. It is NEVER sent to the browser.
- */
-
-// ───────── CONFIG ─────────
-const AUTH_SHEET_ID = "PASTE_YOUR_SEPARATE_AUTH_SPREADSHEET_ID_HERE"; // the OTHER spreadsheet
-const AUTH_TAB_NAME = "Auth";                 // col A=username, col B=password, col C=role (optional)
-const GEMINI_MODEL  = "gemini-flash-latest";  // same model your standalone parser uses; if 404, check AI Studio
-const RESUME_FOLDER = "ATS Resumes";
-// The key now lives in Script Properties (Project Settings ▸ Script Properties, key name: GEMINI_KEY),
-// or run storeGeminiKey() once. This constant is only a last-resort fallback.
-const GEMINI_KEY_FALLBACK = "";
-// ──────────────────────────
-
-function getGeminiKey() {
-  return PropertiesService.getScriptProperties().getProperty("GEMINI_KEY") || GEMINI_KEY_FALLBACK;
-}
-
-/** Run ONCE from the editor to store the key, then blank the value out again for safety. */
-function storeGeminiKey() {
-  PropertiesService.getScriptProperties().setProperty("GEMINI_KEY", "PASTE_KEY_HERE_THEN_RUN");
-  Logger.log("Stored GEMINI_KEY in Script Properties.");
-}
-
-function doGet(e)  { return handleRequest(e); }
-
-function doPost(e) {
-  if (e && e.postData && e.postData.contents) {
-    try { e.parameter = Object.assign({}, e.parameter, JSON.parse(e.postData.contents)); } catch (err) {}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TalentPool ATS</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+<script>
+  if (localStorage.getItem("portalSession") !== "authenticated") window.location.href = "login.html";
+</script>
+<style>
+  :root{
+    --bg:#eef1f6; --panel:#fff; --ink:#0f172a; --muted:#64748b; --line:#e6e9ef;
+    --brand:#4338ca; --brand-2:#7c3aed;
+    --applied:#0ea5e9; --interview:#f59e0b; --offered:#8b5cf6; --joined:#16a34a; --rejected:#ef4444;
   }
-  return handleRequest(e);
-}
+  *{box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:var(--bg);color:var(--ink)}
+  .topbar{background:#0d1426;color:#fff;padding:13px 26px;display:flex;align-items:center;justify-content:space-between}
+  .brand{display:flex;align-items:center;gap:10px}
+  .dot{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--brand),var(--brand-2))}
+  .brand b{font-size:1.15em;letter-spacing:-.3px}
+  .who{font-size:.8em;opacity:.8;margin-right:14px}
+  .role-badge{background:rgba(255,255,255,.14);padding:2px 9px;border-radius:20px;font-size:.72em;margin-left:6px}
+  .btn-logout{background:#ef4444;color:#fff;border:none;padding:8px 16px;border-radius:7px;font-weight:600;cursor:pointer}
+  .wrap{max-width:1440px;margin:0 auto;padding:20px 26px 70px}
+  .tabs{display:flex;gap:6px;margin-bottom:18px;flex-wrap:wrap}
+  .tab{padding:10px 16px;border:none;background:transparent;color:var(--muted);font-weight:600;cursor:pointer;border-radius:8px}
+  .tab.active{background:var(--panel);color:var(--brand);box-shadow:0 2px 10px rgba(0,0,0,.05)}
+  .panel{background:var(--panel);border-radius:14px;padding:22px;box-shadow:0 2px 14px rgba(0,0,0,.04)}
+  .view{display:none}.view.active{display:block}
+  h3.sec{margin:0 0 16px;font-size:1.05em}
+  #loading{display:none;text-align:center;font-weight:700;color:var(--brand);margin:14px 0}
+  .hint{font-size:.8em;color:var(--muted);margin:10px 0 0}
 
-function handleRequest(e) {
-  const action = e.parameter.action;
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin-bottom:18px}
+  .metric{background:var(--panel);border-radius:12px;padding:15px 17px;border-left:4px solid var(--brand)}
+  .metric .n{font-size:1.6em;font-weight:800}
+  .metric .l{font-size:.74em;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
 
-  try {
-    // Frontend fetches the key (stored server-side) after login, then calls Gemini from the browser.
-    if (action === "getConfig") {
-      return json({ status:"success", geminiKey: getGeminiKey(), geminiModel: GEMINI_MODEL });
-    }
+  /* charts */
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:900px){.grid2{grid-template-columns:1fr}}
+  .funnel-row{display:flex;align-items:center;gap:10px;margin-bottom:9px}
+  .funnel-row .lab{width:96px;font-size:.8em;color:var(--muted)}
+  .bar{height:24px;border-radius:6px;min-width:2px;display:flex;align-items:center;justify-content:flex-end;color:#fff;font-size:.76em;font-weight:700;padding:0 8px}
+  .barwrap{flex:1;background:#f1f5f9;border-radius:6px}
 
-    if (action === "login") {
-      let authSS;
-      try { authSS = SpreadsheetApp.openById(AUTH_SHEET_ID); }
-      catch (err) { return json({ status:"error", message:"Cannot open Auth spreadsheet. Check AUTH_SHEET_ID and sharing." }); }
-      const authSheet = authSS.getSheetByName(AUTH_TAB_NAME);
-      if (!authSheet) return json({ status:"error", message:"'" + AUTH_TAB_NAME + "' tab not found in Auth spreadsheet." });
-      const creds = authSheet.getDataRange().getValues();
-      const u = (e.parameter.username || "").trim();
-      const p = (e.parameter.password || "").trim();
-      for (let i = 1; i < creds.length; i++) {
-        if (creds[i][0].toString().trim() === u && creds[i][1].toString().trim() === p) {
-          const role = (creds[i][2] || "Recruiter").toString().trim();
-          return json({ status:"success", message:"Authenticated successfully", user:u, role:role });
-        }
-      }
-      return json({ status:"error", message:"Invalid username or password." });
-    }
+  /* uploader + form */
+  .uploader{border:2px dashed var(--line);border-radius:12px;padding:20px;text-align:center;margin-bottom:18px}
+  .uploader h3{margin:0 0 4px}.uploader p{margin:0 0 12px;color:var(--muted);font-size:.86em}
+  .file-row{display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap}
+  .pill{font-size:.82em;color:var(--brand);font-weight:600}
+  #parseStatus,#scoreStatus,#kitStatus{margin-top:10px;font-size:.86em;font-weight:600;min-height:16px}
+  form{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px}
+  .fg{display:flex;flex-direction:column}
+  label{font-weight:600;font-size:.76em;color:#475569;margin-bottom:5px}
+  input,select,textarea{padding:9px 11px;border:1px solid var(--line);border-radius:8px;font-size:.9em;font-family:inherit}
+  textarea{resize:vertical;min-height:74px}
+  input:focus,select:focus,textarea:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px rgba(67,56,202,.12)}
+  .span2{grid-column:span 2}.full{grid-column:1/-1;display:flex;gap:10px;justify-content:flex-end;margin-top:4px}
+  .act{padding:11px 20px;border:none;border-radius:8px;font-weight:700;cursor:pointer}
+  .btn-primary{background:linear-gradient(135deg,var(--brand),var(--brand-2));color:#fff}
+  .btn-update{background:var(--offered);color:#fff;display:none}
+  .btn-cancel{background:#e2e8f0;color:#334155;display:none}
+  .btn-dark{background:#0d1426;color:#fff}.btn-ghost{background:#eef2ff;color:var(--brand)}
+  .dupe{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;border-radius:8px;padding:10px 12px;font-size:.84em;margin-bottom:12px;display:none}
 
-    if (action === "parseResume") {
-      const parts = resumeParts(e);          // text if provided, else binary fallback
-      parts.push({ text: PARSE_PROMPT });
-      return json({ status:"success", data: geminiJSON(parts) });
-    }
+  /* score box */
+  .scorebox{background:#f8fafc;border:1px solid var(--line);border-radius:10px;padding:14px;margin:14px 0;display:none}
+  .scorehead{display:flex;align-items:center;gap:14px;margin-bottom:8px}
+  .ring{width:58px;height:58px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:1.05em}
+  .cols2{display:grid;grid-template-columns:1fr 1fr;gap:14px;font-size:.84em}
+  .cols2 ul{margin:4px 0 0;padding-left:18px}
 
-    if (action === "scoreResume") {
-      const jd = e.parameter.jobDescription || "(no job description provided — assess general quality)";
-      const parts = resumeParts(e);
-      parts.push({ text: SCORE_PROMPT + "\n\nJOB DESCRIPTION:\n" + jd });
-      return json({ status:"success", data: geminiJSON(parts) });
-    }
+  /* kanban */
+  .board{display:grid;grid-template-columns:repeat(5,1fr);gap:13px}
+  @media(max-width:1000px){.board{grid-template-columns:repeat(2,1fr)}}
+  .col{background:#f6f8fb;border-radius:12px;padding:9px;min-height:280px}
+  .col h4{margin:4px 6px 10px;font-size:.78em;text-transform:uppercase;letter-spacing:.5px;display:flex;justify-content:space-between}
+  .col h4 .count{background:#fff;border-radius:20px;padding:1px 9px;font-size:.85em}
+  .col.drop{outline:2px dashed var(--brand);outline-offset:-4px}
+  .card{background:#fff;border-radius:10px;padding:10px 11px;margin-bottom:9px;box-shadow:0 1px 4px rgba(0,0,0,.06);cursor:grab;border-left:4px solid var(--line)}
+  .card .nm{font-weight:700;font-size:.9em}.card .ro{font-size:.78em;color:var(--muted);margin:2px 0 6px}
+  .card .meta{font-size:.72em;color:#94a3b8;display:flex;justify-content:space-between;align-items:center}
+  .scorechip{font-weight:800;border-radius:6px;padding:1px 7px;color:#fff;font-size:.72em}
+  .s-Applied{border-left-color:var(--applied)}.s-Interviewing{border-left-color:var(--interview)}
+  .s-Offered{border-left-color:var(--offered)}.s-Joined{border-left-color:var(--joined)}.s-Rejected{border-left-color:var(--rejected)}
 
-    // ONE call that extracts fields AND scores — use this to halve quota usage per resume.
-    if (action === "parseAndScore") {
-      const jd = e.parameter.jobDescription || "(no job description provided — score general quality)";
-      const parts = resumeParts(e);
-      parts.push({ text: PARSE_PROMPT + "\n\nAlso append these keys to the SAME JSON object: " +
-        '"score" (0-100 match vs the JD below), "verdict" (one short line), ' +
-        '"strengths" (array), "gaps" (array).\n\nJOB DESCRIPTION:\n' + jd });
-      return json({ status:"success", data: geminiJSON(parts) });
-    }
+  /* table */
+  .toolbar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+  .toolbar input,.toolbar select{padding:8px 10px}
+  .toolbar input[type=search]{flex:1;min-width:200px}
+  .table-responsive{overflow-x:auto;border:1px solid var(--line);border-radius:10px}
+  table{width:100%;border-collapse:collapse;font-size:.83em}
+  th,td{border-bottom:1px solid var(--line);padding:10px 13px;white-space:nowrap;text-align:left}
+  th{background:#0d1426;color:#fff;cursor:pointer;position:sticky;top:0}
+  tr:nth-child(even) td{background:#f8fafc}
+  tr.dupe-row td{background:#fff7ed!important}
+  .abtn{padding:4px 10px;border:none;border-radius:6px;cursor:pointer;font-size:.85em;font-weight:600;margin:0 2px}
+  .btn-edit{background:#fde68a;color:#78350f}.btn-delete{background:#fecaca;color:#7f1d1d}
+  .status-tag{padding:2px 9px;border-radius:20px;color:#fff;font-size:.8em;font-weight:600}
 
-    if (action === "generateKit") {
-      const role = e.parameter.role || "";
-      const jd = e.parameter.jobDescription || "";
-      return json({ status:"success", data: geminiJSON([
-        { text: KIT_PROMPT + "\n\nROLE: " + role + "\n\nJOB DESCRIPTION:\n" + jd }
-      ]) });
-    }
+  /* kit */
+  .kit-q{background:#f8fafc;border-left:3px solid var(--brand);border-radius:8px;padding:11px 13px;margin-bottom:9px}
+  .kit-q .focus{font-size:.7em;text-transform:uppercase;letter-spacing:.4px;color:var(--brand);font-weight:700}
+  .sc-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed var(--line);font-size:.88em}
+  .badge{display:inline-block;background:#eef2ff;color:var(--brand);font-size:.7em;font-weight:700;padding:2px 8px;border-radius:20px;margin-left:8px}
 
-    if (action === "uploadResume") {
-      return json({ status:"success", link: saveResumeToDrive(e.parameter.fileData, e.parameter.mimeType, e.parameter.fileName || "resume") });
-    }
+  /* ── upgrade styles ── */
+  .topbar{background:linear-gradient(90deg,#0b1220,#141d33);box-shadow:0 2px 12px rgba(0,0,0,.18)}
+  .tab{transition:.15s} .tab:hover{color:var(--brand)}
+  .panel{border:1px solid #eceef3}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .seg-btn{padding:8px 12px;border:none;background:#fff;color:var(--muted);font-weight:600;cursor:pointer;font-size:.84em}
+  .seg-btn.active{background:var(--brand);color:#fff}
+  .stars{color:#f59e0b;letter-spacing:1px;font-size:.95em;white-space:nowrap}
+  .stars .off{color:#dfe3ea}
+  .starpick{display:flex;gap:3px;font-size:1.3em;color:#dfe3ea;cursor:pointer;user-select:none}
+  .starpick .on{color:#f59e0b}
+  .r10{display:inline-block;min-width:34px;text-align:center;font-weight:800;border-radius:6px;padding:2px 6px;color:#fff;font-size:.8em}
+  .cardgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(265px,1fr));gap:14px}
+  .ccard{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px;box-shadow:0 2px 10px rgba(0,0,0,.04);position:relative;transition:.15s}
+  .ccard:hover{box-shadow:0 8px 22px rgba(0,0,0,.09);transform:translateY(-2px)}
+  .ccard.dupe-row{border-color:#fed7aa;background:#fff7ed}
+  .ccard .sel{position:absolute;top:12px;right:12px}
+  .ccard .ava{width:46px;height:46px;border-radius:50%;background:linear-gradient(135deg,var(--brand),var(--brand-2));color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1.05em;flex-shrink:0}
+  .ccard .top{display:flex;gap:12px;align-items:center;margin-bottom:8px}
+  .ccard .nm{font-weight:700;line-height:1.2}.ccard .rl{font-size:.82em;color:var(--muted)}
+  .ccard .co{font-size:.8em;color:#334155;margin:2px 0}
+  .ccard .row{display:flex;justify-content:space-between;align-items:center;margin-top:8px;font-size:.8em;color:var(--muted)}
+  .ccard .tagchip{background:#eef2ff;color:var(--brand);border-radius:20px;padding:2px 9px;font-size:.72em;font-weight:700}
+  .ccard .cbtns{display:flex;gap:6px;margin-top:12px}
+  .ccard .cbtns button,.ccard .cbtns a{flex:1;text-align:center;text-decoration:none;padding:6px;border-radius:7px;font-size:.78em;font-weight:600;border:none;cursor:pointer}
+  textarea#JD{min-height:120px}
+</style>
+</head>
+<body>
 
-    // ── CRUD ──
-    const sheetName = e.parameter.sheetName || "Sheet1";
-    const sheet = ss.getSheetByName(sheetName);
-    if (!sheet) return json({ status:"error", message:"Sheet tab '" + sheetName + "' not found." });
-    const values = sheet.getDataRange().getValues();
-    const headers = values[0];
+<div class="topbar">
+  <div class="brand"><span class="dot"></span><b>TalentPool ATS</b></div>
+  <div><span class="who" id="whoami"></span><button class="btn-logout" onclick="logout()">Log Out</button></div>
+</div>
 
-    if (action === "read") {
-      const rows = [];
-      for (let i = 1; i < values.length; i++) {
-        const r = { rowNumber: i + 1 };
-        for (let j = 0; j < headers.length; j++) if (headers[j]) r[headers[j]] = values[i][j];
-        rows.push(r);
-      }
-      return json({ status:"success", data: rows });
-    }
-    if (action === "create") {
-      const newRow = headers.map(h => h === "S.no" ? sheet.getLastRow() : (e.parameter[h] !== undefined ? e.parameter[h] : ""));
-      sheet.appendRow(newRow);
-      return json({ status:"success", message:"Record registered successfully!" });
-    }
-    if (action === "update") {
-      const rn = parseInt(e.parameter.rowNumber); if (!rn) throw new Error("Missing rowNumber.");
-      headers.forEach((h, i) => { if (h !== "S.no" && e.parameter[h] !== undefined) sheet.getRange(rn, i + 1).setValue(e.parameter[h]); });
-      return json({ status:"success", message:"Record updated successfully!" });
-    }
-    if (action === "delete") {
-      const rn = parseInt(e.parameter.rowNumber); if (!rn) throw new Error("Missing rowNumber.");
-      sheet.deleteRow(rn);
-      return json({ status:"success", message:"Record deleted successfully!" });
-    }
-    return json({ status:"error", message:"Action not recognized." });
+<div class="wrap">
+  <div class="tabs">
+    <button class="tab active" data-v="dash"   onclick="sv('dash',this)">Dashboard</button>
+    <button class="tab"        data-v="pipe"   onclick="sv('pipe',this)">Pipeline</button>
+    <button class="tab"        data-v="cands"  onclick="sv('cands',this)">Candidates</button>
+    <button class="tab perm"   data-v="jobs"   onclick="sv('jobs',this)">Job Postings</button>
+    <button class="tab perm"   data-v="add"    onclick="sv('add',this)">Add / Edit</button>
+    <button class="tab"        data-v="kit"    onclick="sv('kit',this)">AI Interview Kit</button>
+  </div>
 
-  } catch (error) {
-    return json({ status:"error", message: error.toString() });
-  }
-}
+  <div id="loading">Syncing with Google Sheet…</div>
 
-// ───────── Gemini prompts ─────────
-// Builds the content parts: prefer client-extracted TEXT (light, quota-friendly,
-// the way the standalone parser works). Fall back to the raw file only if no text was sent.
-function resumeParts(e) {
-  if (e.parameter.resumeText && e.parameter.resumeText.trim()) {
-    return [{ text: "RESUME TEXT:\n" + e.parameter.resumeText }];
-  }
-  if (e.parameter.fileData) {
-    return [{ inline_data: { mime_type: e.parameter.mimeType || "application/pdf", data: e.parameter.fileData } }];
-  }
-  throw new Error("No resume text or file supplied.");
-}
+  <!-- DASHBOARD -->
+  <div class="view active" id="view-dash">
+    <div class="metrics" id="metrics"></div>
+    <div class="grid2">
+      <div class="panel"><h3 class="sec">Recruitment funnel</h3><div id="funnel"></div>
+        <p class="hint">Offer acceptance and joining ratios at a glance.</p></div>
+      <div class="panel"><h3 class="sec">Source / vendor performance</h3><div id="sources"></div>
+        <p class="hint">Submissions grouped by source — your vendor-ROI view.</p></div>
+    </div>
+  </div>
 
-const PARSE_PROMPT =
-  'Parse the resume above and return ONLY JSON (empty string if a field is absent, no markdown): ' +
-  '{"Candidate Name":"","Mail Id":"","Contact No":"","Designation":"","Department":"","Role":"","Source":"",' +
-  '"Skills":"","Summary":"","linkedin_url":"",' +
-  '"experience":[{"company":"","role":"","start_year":"","end_year":"","duration":"","description":""}],' +
-  '"education":[{"institution":"","degree":"","year":""}]}. ' +
-  '"Role"=most recent/senior title. "Designation"=current title. "Department"=function area. ' +
-  '"Skills"=comma-separated top skills. "Summary"=one sentence. ' +
-  'Parse start_year and end_year as clean numeric years ("Present" allowed for end_year).';
+  <!-- PIPELINE -->
+  <div class="view" id="view-pipe">
+    <div class="panel"><h3 class="sec">Applicant pipeline</h3><div class="board" id="board"></div>
+      <p class="hint">Drag a card to advance the stage — saves to the sheet automatically. AI match score shown top-right of each card.</p></div>
+  </div>
 
-const SCORE_PROMPT =
-  'You are an AI shortlisting engine. Score this resume against the job description below. ' +
-  'Return ONLY JSON: {"score":0,"verdict":"","strengths":["",""],"gaps":["",""]}. ' +
-  '"score"=integer 0-100 match. "verdict"=one short line (Strong fit / Possible / Weak). ' +
-  '"strengths" and "gaps"=up to 4 concise bullets each. No markdown.';
+  <!-- CANDIDATES -->
+  <div class="view" id="view-cands">
+    <div class="panel">
+      <div class="toolbar">
+        <input type="search" id="search" placeholder="Search name, role, company, email, skills…" oninput="renderCands()">
+        <select id="fStage" onchange="renderCands()"><option value="">All stages</option></select>
+        <select id="fSource" onchange="renderCands()"><option value="">All sources</option></select>
+        <select id="fJob" onchange="renderCands()"><option value="">All jobs</option></select>
+        <select id="sort" onchange="renderCands()">
+          <option value="score">Sort: AI match ↓</option>
+          <option value="stars">Sort: stars ↓</option>
+          <option value="name">Sort: name</option>
+          <option value="recent">Sort: row order</option>
+        </select>
+        <div class="seg">
+          <button id="vList" class="seg-btn active" onclick="setCandView('list')">☰ List</button>
+          <button id="vGrid" class="seg-btn" onclick="setCandView('grid')">▦ Grid</button>
+        </div>
+        <button class="act btn-ghost" style="padding:8px 14px" onclick="shareSelected()">Share selected ↗</button>
+      </div>
 
-const KIT_PROMPT =
-  'You are a structured-interview designer. For the role and JD below build a first-round screening kit. ' +
-  'Return ONLY JSON: {"questions":[{"q":"","focus":""}],"scorecard":[{"criterion":"","weight":""}]}. ' +
-  'Provide 6-8 role-specific questions, each with a 1-3 word "focus" tag. ' +
-  'Provide 4-6 scorecard criteria with a percentage weight string that sums to ~100%. No markdown.';
+      <div id="candList">
+        <div class="table-responsive">
+          <table>
+            <thead><tr>
+              <th><input type="checkbox" id="selAll" onclick="toggleSelectAll(this)"></th>
+              <th>Name</th><th>Match</th><th>Rating</th><th>Role</th><th>Current Co.</th><th>Status</th>
+              <th>Tagged Job</th><th>Dept</th><th>Contact</th><th>CV</th><th>Profile</th><th>Actions</th>
+            </tr></thead>
+            <tbody id="tableBody"></tbody>
+          </table>
+        </div>
+        <p class="hint">Tick rows then “Share selected” to export a recruiter-ready bundle. Orange = possible duplicate.</p>
+      </div>
 
-function geminiJSON(parts) {
-  if (!parts || !parts.length) throw new Error("No content for AI.");
-  const payload = { contents: [{ parts: parts }], generationConfig: { temperature: 0.2, responseMimeType: "application/json" } };
-  // Identical auth to the working standalone parser: key goes in the HEADER, not the URL.
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent";
-  const opts = {
-    method: "post",
-    contentType: "application/json",
-    headers: { "X-goog-api-key": getGeminiKey() },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
+      <div id="candGrid" class="cardgrid" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- JOB POSTINGS -->
+  <div class="view" id="view-jobs">
+    <div class="panel">
+      <h3 class="sec">Job postings</h3>
+      <form id="jobForm" style="margin-bottom:8px">
+        <input type="hidden" id="jobRow">
+        <div class="fg"><label>Job ID</label><input type="text" id="Job ID" placeholder="e.g. ENG-014" required></div>
+        <div class="fg"><label>Job Title</label><input type="text" id="Job Title" required></div>
+        <div class="fg"><label>Department</label><input type="text" id="Job Department" data-h="Department"></div>
+        <div class="fg"><label>Location</label><input type="text" id="Location"></div>
+        <div class="fg"><label>Hiring Manager</label><input type="text" id="Hiring Manager"></div>
+        <div class="fg"><label>HM Email</label><input type="email" id="HM Email"></div>
+        <div class="fg"><label>HOD</label><input type="text" id="HOD"></div>
+        <div class="fg"><label>HOD Email</label><input type="email" id="HOD Email"></div>
+        <div class="fg"><label>Status</label><select id="Status"><option>Open</option><option>On Hold</option><option>Closed</option></select></div>
+        <div class="fg span2"><label>Job Description</label><textarea id="JD" placeholder="Paste the full JD — used for AI matching & auto-tagging…"></textarea></div>
+        <div class="full">
+          <button type="button" class="act btn-cancel" id="jobCancel" onclick="resetJobForm()">Cancel</button>
+          <button type="button" class="act btn-update" id="jobUpdate" onclick="saveJob('update')">Update Posting</button>
+          <button type="button" class="act btn-primary" id="jobSubmit" onclick="saveJob('create')">Create Posting</button>
+        </div>
+      </form>
+      <div class="table-responsive" style="margin-top:10px">
+        <table>
+          <thead><tr><th>Job ID</th><th>Title</th><th>Dept</th><th>Hiring Manager</th><th>HOD</th><th>Status</th><th>Applicants</th><th>Actions</th></tr></thead>
+          <tbody id="jobsBody"></tbody>
+        </table>
+      </div>
+      <p class="hint">Emails captured here are used when sharing candidate bundles with the Hiring Manager / HOD.</p>
+    </div>
+  </div>
+
+  <!-- ADD / EDIT -->
+  <div class="view" id="view-add">
+    <div class="panel">
+      <div class="uploader" id="uploader">
+        <h3>Resume intake</h3>
+        <p>Parse a resume to auto-fill fields, store the original in Drive, and score it against a job description.</p>
+        <input type="text" id="apiKey" placeholder="Gemini key — optional, overrides the server key…" style="width:100%;margin-bottom:10px" oninput="localStorage.setItem('geminiKey',this.value)">
+        <div class="file-row">
+          <input type="file" id="resumeFile" accept=".pdf,.doc,.docx,.png,.jpg,.jpeg" onchange="onFilePicked()">
+          <button class="act btn-dark" onclick="parseSelectedResume()">Parse &amp; store</button>
+          <button class="act btn-ghost" onclick="scoreSelectedResume()">Score vs JD ↓</button>
+        </div>
+        <div id="parseStatus"></div>
+        <textarea id="jd" placeholder="Paste the job description here to enable AI scoring & ranking…" style="margin-top:12px;width:100%"></textarea>
+        <div id="scoreStatus"></div>
+      </div>
+
+      <div class="scorebox" id="scorebox"></div>
+      <div class="dupe" id="dupeWarn"></div>
+
+      <input type="hidden" id="rowNumber"><input type="hidden" id="Resume">
+      <input type="hidden" id="Tagged Job"><input type="hidden" id="Profile JSON">
+      <form id="candidateForm">
+        <div class="fg span2"><label>Job posting (auto-fills JD &amp; tags the candidate)</label>
+          <div style="display:flex;gap:8px">
+            <select id="jobSelect" style="flex:1" onchange="onJobPicked()"><option value="">— none —</option></select>
+            <button type="button" class="act btn-ghost" style="padding:9px 14px;white-space:nowrap" onclick="autoTagBestJob()">✦ Auto-match best job</button>
+          </div></div>
+        <div class="fg"><label>Position ID</label><input type="text" id="Position ID" required></div>
+        <div class="fg"><label>Role</label><input type="text" id="Role" required></div>
+        <div class="fg"><label>Candidate Status</label>
+          <select id="Candidate Status"><option>Applied</option><option>Interviewing</option><option>Offered</option><option>Joined</option><option>Rejected</option></select></div>
+        <div class="fg"><label>Candidate Name</label><input type="text" id="Candidate Name" required></div>
+        <div class="fg"><label>Current Company</label><input type="text" id="Current Company"></div>
+        <div class="fg"><label>Contact No</label><input type="text" id="Contact No" oninput="checkDupe()" required></div>
+        <div class="fg"><label>Mail Id</label><input type="email" id="Mail Id" oninput="checkDupe()" required></div>
+        <div class="fg"><label>AI Match Score (/100)</label><input type="number" id="AI Score" min="0" max="100" oninput="syncRatings()"></div>
+        <div class="fg"><label>Rating (/10)</label><input type="number" id="Rating10" min="0" max="10" step="0.5"></div>
+        <div class="fg"><label>Stars</label><div id="starPick" class="starpick"></div><input type="hidden" id="Stars"></div>
+        <div class="fg"><label>Designation</label><input type="text" id="Designation"></div>
+        <div class="fg"><label>Department</label><input type="text" id="Department"></div>
+        <div class="fg"><label>Interview Date</label><input type="date" id="Interview Date"></div>
+        <div class="fg"><label>Offered Date</label><input type="date" id="Offered Date"></div>
+        <div class="fg"><label>Date of Joining</label><input type="date" id="Date of Joining"></div>
+        <div class="fg"><label>CTC</label><input type="number" id="CTC"></div>
+        <div class="fg"><label>Variable</label><input type="text" id="variable"></div>
+        <div class="fg"><label>Source</label><input type="text" id="Source"></div>
+        <div class="fg"><label>Offer Acceptance</label><select id="Offer Acceptance"><option>Pending</option><option>Accepted</option><option>Declined</option></select></div>
+        <div class="fg span2"><label>AI Matching Remarks</label><input type="text" id="Score Notes"></div>
+        <div class="fg span2"><label>Feedback / Remarks</label><input type="text" id="Remarks"></div>
+        <div class="full">
+          <button type="button" class="act btn-ghost" onclick="downloadProfileFromForm()">⬇ HTML profile</button>
+          <button type="button" class="act btn-cancel" id="cancelBtn" onclick="resetForm()">Cancel</button>
+          <button type="button" class="act btn-update" id="updateBtn" onclick="saveRecord('update')">Update Details</button>
+          <button type="button" class="act btn-primary" id="submitBtn" onclick="saveRecord('create')">Register Candidate</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- INTERVIEW KIT -->
+  <div class="view" id="view-kit">
+    <div class="panel">
+      <h3 class="sec">AI screening kit generator</h3>
+      <p class="hint" style="margin-top:0">Generates role-based screening questions and a weighted scorecard for structured first-round interviews. This is an interviewer-prep tool, not a live automated interviewer.</p>
+      <form style="margin-top:14px">
+        <div class="fg"><label>Role / Title</label><input type="text" id="kitRole" placeholder="e.g. Senior Backend Engineer"></div>
+        <div class="fg span2"><label>Job description (optional, improves quality)</label><textarea id="kitJd" placeholder="Paste JD…"></textarea></div>
+        <div class="full"><button type="button" class="act btn-primary" onclick="generateKit()">Generate kit</button></div>
+      </form>
+      <div id="kitStatus"></div>
+      <div id="kitOut" style="margin-top:10px"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const API_URL = "https://script.google.com/macros/s/AKfycbxx3xc-xS4AxlFjiivkDZga5BgReYjSHJX6gHzGkYbiPicoNt1A7mzqr8QAY5OHoONdLA/exec";
+  const TARGET_TAB = "Candidate";
+  const JOBS_TAB = "Jobs";
+  const STAGES = ["Applied","Interviewing","Offered","Joined","Rejected"];
+  const COLORS = {Applied:"#0ea5e9",Interviewing:"#f59e0b",Offered:"#8b5cf6",Joined:"#16a34a",Rejected:"#ef4444"};
+  // columns written to the Candidate sheet
+  const fields = ["Position ID","Role","Candidate Status","Candidate Name","Current Company","Contact No","Mail Id","Designation",
+                  "Department","Interview Date","Offered Date","Date of Joining","CTC","variable","Source",
+                  "Offer Acceptance","Remarks","Resume","AI Score","Score Notes","Tagged Job","Rating10","Stars","Profile JSON"];
+  const jobFields = ["Job ID","Job Title","Department","Hiring Manager","HM Email","HOD","HOD Email","Location","Status","JD"];
+  let allData = [], jobs = [], ROLE = "Recruiter", candView = "list", selected = new Set();
+
+  window.onload = () => {
+    ROLE = localStorage.getItem("portalRole") || "Recruiter";
+    const savedKey = localStorage.getItem("geminiKey"); if(savedKey){ const k=document.getElementById('apiKey'); if(k) k.value=savedKey; }
+    document.getElementById('whoami').innerHTML =
+      "Signed in as " + (localStorage.getItem("portalUser")||"user") + `<span class="role-badge">${ROLE}</span>`;
+    if (ROLE.toLowerCase() === "viewer") document.querySelectorAll('.tab.perm').forEach(t=>t.style.display="none");
+    fetchConfig(); setupDrag(); renderStarPicker(0); fetchData();
   };
-
-  let res = UrlFetchApp.fetch(url, opts);
-  // One automatic retry for per-minute (RPM) throttling, which clears in a few seconds.
-  if (res.getResponseCode() === 429) { Utilities.sleep(4000); res = UrlFetchApp.fetch(url, opts); }
-
-  const code = res.getResponseCode();
-  if (code === 429) throw new Error(
-    "Gemini returned 429 (quota). Auth is fine — the key's quota pool is drained. " +
-    "This pool is SHARED with your standalone parser, so heavy testing exhausts it for both. " +
-    "Fix: wait for the daily reset, or enable billing on the key's Google Cloud project (free tier caps are very low).");
-  if (code === 400 || code === 401 || code === 403) throw new Error(
-    "Gemini auth error " + code + ": " + res.getContentText().slice(0, 200) +
-    " — check the key is valid/active and that '" + GEMINI_MODEL + "' is available to it.");
-  if (code !== 200) throw new Error("Gemini error " + code + ": " + res.getContentText().slice(0, 300));
-
-  const body = JSON.parse(res.getContentText());
-  const text = body && body.candidates && body.candidates[0] && body.candidates[0].content.parts[0].text;
-  if (!text) throw new Error("Gemini returned no content (response may have been blocked or empty).");
-  return JSON.parse(text);
-}
-
-function saveResumeToDrive(base64Data, mimeType, fileName) {
-  if (!base64Data) throw new Error("No file data for upload.");
-  const folders = DriveApp.getFoldersByName(RESUME_FOLDER);
-  const folder = folders.hasNext() ? folders.next() : DriveApp.createFolder(RESUME_FOLDER);
-  const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyyMMdd_HHmmss");
-  const blob = Utilities.newBlob(Utilities.base64Decode(base64Data), mimeType || "application/pdf", stamp + "_" + fileName);
-  const file = folder.createFile(blob);
-  try { file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch (e) {}
-  return file.getUrl();
-}
-
-function json(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
-
-/**
- * DIAGNOSTIC — run this directly from the editor (select testGemini → Run) and read View ▸ Logs.
- * It makes ONE tiny text call so you can see the raw HTTP code with nothing else involved:
- *   200 = key + quota are good (the ATS will work)
- *   429 = quota pool is drained — wait for reset or enable billing (no code can fix this)
- *   400/401/403 = key or model problem
- */
-function testGemini() {
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent";
-  const res = UrlFetchApp.fetch(url, {
-    method: "post",
-    contentType: "application/json",
-    headers: { "X-goog-api-key": getGeminiKey() },
-    payload: JSON.stringify({ contents: [{ parts: [{ text: "Reply with the single word: OK" }] }] }),
-    muteHttpExceptions: true
-  });
-  const out = "HTTP " + res.getResponseCode() + "\n" + res.getContentText().slice(0, 500);
-  Logger.log(out);
-  return out;
-}
-
-// ═══════════════════════════════════════════════════════════
-//  ONE-TIME SETUP
-//  Run initialSetup() ONCE from the Apps Script editor
-//  (select it in the toolbar dropdown → Run → approve permissions).
-//  Safe to re-run: it only adds what's missing, never deletes data.
-// ═══════════════════════════════════════════════════════════
-
-// Canonical header order. MUST match the frontend `fields` array + "S.no".
-const CANONICAL_HEADERS = [
-  "S.no","Position ID","Role","Candidate Status","Candidate Name","Current Company","Contact No","Mail Id",
-  "Designation","Department","Interview Date","Offered Date","Date of Joining","CTC",
-  "variable","Source","Offer Acceptance","Remarks","Resume","AI Score","Score Notes",
-  "Tagged Job","Rating10","Stars","Profile JSON"
-];
-
-const JOB_HEADERS = [
-  "Job ID","Job Title","Department","Hiring Manager","HM Email","HOD","HOD Email",
-  "Location","Status","Posted Date","JD"
-];
-
-function initialSetup() {
-  const logs = [];
-  logs.push(setupCandidateSheet());
-  logs.push(setupJobsSheet());
-  logs.push(setupAuthSheet());
-  const summary = logs.join("\n");
-  Logger.log(summary);
-  return summary; // visible in the execution log
-}
-
-/** Generic "create tab with headers, else append missing" used by both operational tabs. */
-function ensureSheet(name, headers) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName(name);
-  if (!sheet) {
-    sheet = ss.insertSheet(name);
-    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    formatHeader(sheet, headers.length);
-    return "✔ Created '" + name + "' tab with " + headers.length + " columns.";
+  let REMOTE_KEY = "";   // key pulled from Apps Script Script Properties after login
+  function fetchConfig(){
+    fetch(`${API_URL}?action=getConfig`,{method:"GET",redirect:"follow"})
+      .then(r=>r.json()).then(res=>{
+        if(res.status==="success" && res.geminiKey){
+          REMOTE_KEY = res.geminiKey;
+          const k=document.getElementById('apiKey');
+          if(k && !k.value){ k.placeholder="Key loaded from server (Script Properties)"; }
+        }
+      }).catch(()=>{});
   }
-  const existing = sheet.getRange(1, 1, 1, Math.max(1, sheet.getLastColumn())).getValues()[0].map(h => h.toString().trim());
-  const missing = headers.filter(h => existing.indexOf(h) === -1
-                                   && !(h === "Position ID" && existing.indexOf("Position ID.") !== -1));
-  if (missing.length) {
-    sheet.getRange(1, sheet.getLastColumn() + 1, 1, missing.length).setValues([missing]);
-    formatHeader(sheet, sheet.getLastColumn());
-    return "✔ '" + name + "' tab existed — added missing columns: " + missing.join(", ");
+  const canEdit = () => ROLE.toLowerCase() !== "viewer";
+  const showLoading = s => document.getElementById('loading').style.display = s?'block':'none';
+  function sv(v,el){ document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));
+    document.getElementById('view-'+v).classList.add('active');
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active')); el.classList.add('active'); }
+
+  function fetchData(){
+    showLoading(true);
+    Promise.all([
+      fetch(`${API_URL}?action=read&sheetName=${encodeURIComponent(TARGET_TAB)}`,{method:"GET",redirect:"follow"}).then(r=>r.json()),
+      fetch(`${API_URL}?action=read&sheetName=${encodeURIComponent(JOBS_TAB)}`,{method:"GET",redirect:"follow"}).then(r=>r.json()).catch(()=>({status:"error"}))
+    ]).then(([cRes,jRes])=>{
+      if(cRes.status==="success") allData=cRes.data;
+      if(jRes && jRes.status==="success") jobs=jRes.data;
+      renderAll(); showLoading(false);
+    }).catch(e=>{console.error(e);showLoading(false);});
   }
-  return "✔ '" + name + "' tab already complete — no changes.";
-}
+  const sc = r => parseInt(r["AI Score"])||0;
+  const pos = r => r["Position ID."]||r["Position ID"]||'';
+  const jobById = id => jobs.find(j=>S(j["Job ID"])===S(id));
+  function renderAll(){ markDupes(); renderMetrics(); renderFunnel(); renderSources(); renderBoard(); buildFilters(); buildJobDropdowns(); renderCands(); renderJobs(); }
 
-function setupCandidateSheet() { return ensureSheet("Candidate", CANONICAL_HEADERS); }
-function setupJobsSheet()      { return ensureSheet("Jobs", JOB_HEADERS); }
-
-/** Creates/repairs the "Auth" tab in the SEPARATE auth spreadsheet (by AUTH_SHEET_ID). */
-function setupAuthSheet() {
-  if (!AUTH_SHEET_ID || AUTH_SHEET_ID.indexOf("PASTE") === 0) {
-    return "⚠ Skipped Auth setup — set AUTH_SHEET_ID in CONFIG first, then re-run initialSetup().";
+  // duplicate detection
+  function markDupes(){
+    const seen={};
+    allData.forEach(r=>{ const k=(S(r["Mail Id"])+'|'+S(r["Contact No"])).toLowerCase(); r.__dupe=false;
+      if(k!=='|'){ if(seen[k]) { r.__dupe=true; allData[seen[k]].__dupe=true; } else seen[k]=allData.indexOf(r); } });
   }
-  let authSS;
-  try { authSS = SpreadsheetApp.openById(AUTH_SHEET_ID); }
-  catch (e) { return "✘ Could not open Auth spreadsheet. Check AUTH_SHEET_ID and that it's shared with this account."; }
 
-  let auth = authSS.getSheetByName(AUTH_TAB_NAME);
-  if (!auth) {
-    auth = authSS.insertSheet(AUTH_TAB_NAME);
-    auth.getRange(1, 1, 1, 3).setValues([["Username", "Password", "Role"]]);
-    auth.getRange(2, 1, 1, 3).setValues([["admin", "admin123", "Admin"]]); // CHANGE THIS immediately
-    formatHeader(auth, 3);
-    return "✔ Created '" + AUTH_TAB_NAME + "' tab with a sample admin login (admin / admin123). CHANGE IT NOW.";
+  function renderMetrics(){
+    const c=STAGES.reduce((a,s)=>(a[s]=0,a),{}); let acc=0,off=0,scSum=0,scN=0;
+    allData.forEach(r=>{ if(c[r["Candidate Status"]]!==undefined)c[r["Candidate Status"]]++;
+      if((r["Offer Acceptance"]||'')==="Accepted")acc++; if(r["Offered Date"]||c.Offered)off=off;
+      if(sc(r)){scSum+=sc(r);scN++;} });
+    const offered=c.Offered+c.Joined; const accRate=offered?Math.round(acc/offered*100):0;
+    const avg=scN?Math.round(scSum/scN):0;
+    const cards=[{l:"Total",n:allData.length},...STAGES.map(s=>({l:s,n:c[s]})),
+      {l:"Accept %",n:accRate+"%"},{l:"Avg AI score",n:avg}];
+    document.getElementById('metrics').innerHTML=cards.map(x=>`<div class="metric"><div class="n">${x.n}</div><div class="l">${x.l}</div></div>`).join('');
   }
-  // Ensure a Role column (col C) exists.
-  const hdr = auth.getRange(1, 1, 1, Math.max(3, auth.getLastColumn())).getValues()[0];
-  if (!hdr[2]) auth.getRange(1, 3).setValue("Role");
-  return "✔ '" + AUTH_TAB_NAME + "' tab already present — left intact.";
-}
+  function renderFunnel(){
+    const c=STAGES.reduce((a,s)=>(a[s]=0,a),{}); allData.forEach(r=>{if(c[r["Candidate Status"]]!==undefined)c[r["Candidate Status"]]++;});
+    const max=Math.max(1,...STAGES.map(s=>c[s]));
+    document.getElementById('funnel').innerHTML=STAGES.map(s=>`
+      <div class="funnel-row"><span class="lab">${s}</span>
+        <div class="barwrap"><div class="bar" style="width:${Math.max(4,c[s]/max*100)}%;background:${COLORS[s]}">${c[s]}</div></div></div>`).join('');
+  }
+  function renderSources(){
+    const m={}; allData.forEach(r=>{const s=r["Source"]||"Unknown"; m[s]=(m[s]||0)+1;});
+    const ent=Object.entries(m).sort((a,b)=>b[1]-a[1]).slice(0,8); const max=Math.max(1,...ent.map(e=>e[1]));
+    document.getElementById('sources').innerHTML = ent.length? ent.map(([s,n])=>`
+      <div class="funnel-row"><span class="lab">${esc(s)}</span>
+        <div class="barwrap"><div class="bar" style="width:${Math.max(4,n/max*100)}%;background:var(--brand)">${n}</div></div></div>`).join('')
+      : '<p class="hint">No source data yet.</p>';
+  }
 
-function formatHeader(sheet, cols) {
-  const h = sheet.getRange(1, 1, 1, cols);
-  h.setFontWeight("bold").setFontColor("#ffffff").setBackground("#0d1426");
-  sheet.setFrozenRows(1);
-}
+  // kanban
+  function renderBoard(){
+    document.getElementById('board').innerHTML=STAGES.map(s=>{
+      const items=allData.filter(r=>r["Candidate Status"]===s);
+      return `<div class="col" data-stage="${s}"><h4>${s}<span class="count">${items.length}</span></h4>${items.map(cardHTML).join('')}</div>`;
+    }).join('');
+    document.querySelectorAll('.card').forEach(c=>c.addEventListener('dragstart',e=>e.dataTransfer.setData('text/plain',c.dataset.row)));
+  }
+  function cardHTML(r){
+    const s=sc(r); const chip=s?`<span class="scorechip" style="background:${scoreColor(s)}">${s}</span>`:'';
+    const cv=r["Resume"]?`<a class="cv" href="${r["Resume"]}" target="_blank" style="color:var(--brand);font-weight:600;text-decoration:none" onclick="event.stopPropagation()">CV ↗</a>`:'';
+    return `<div class="card s-${r["Candidate Status"]}" draggable="${canEdit()}" data-row="${r.rowNumber}" onclick="editRecord(${r.rowNumber})">
+      <div class="nm">${esc(r["Candidate Name"])||'—'} ${chip}</div>
+      <div class="ro">${esc(r["Role"])||''}${r["Department"]?' · '+esc(r["Department"]):''}</div>
+      <div class="meta"><span>${esc(r["Source"])||'—'}</span>${cv}</div></div>`;
+  }
+  function setupDrag(){
+    document.addEventListener('dragover',e=>{const col=e.target.closest('.col');if(!col)return;e.preventDefault();col.classList.add('drop');});
+    document.addEventListener('dragleave',e=>{const col=e.target.closest('.col');if(col)col.classList.remove('drop');});
+    document.addEventListener('drop',e=>{const col=e.target.closest('.col');if(!col)return;e.preventDefault();col.classList.remove('drop');
+      if(!canEdit())return; moveStage(parseInt(e.dataTransfer.getData('text/plain')),col.dataset.stage);});
+  }
+  function moveStage(rn,stage){
+    const r=allData.find(x=>x.rowNumber===rn); if(!r||r["Candidate Status"]===stage)return;
+    r["Candidate Status"]=stage; renderAll();
+    fetch(`${API_URL}?action=update&sheetName=${encodeURIComponent(TARGET_TAB)}&rowNumber=${rn}&${encodeURIComponent("Candidate Status")}=${encodeURIComponent(stage)}`,
+      {method:"GET",redirect:"follow"}).then(r=>r.json()).catch(e=>{console.error(e);fetchData();});
+  }
+
+  // ── candidates: filters, list + grid, ratings ──
+  function buildFilters(){
+    document.getElementById('fSource').innerHTML='<option value="">All sources</option>'+
+      [...new Set(allData.map(r=>r["Source"]).filter(Boolean))].map(s=>`<option>${esc(s)}</option>`).join('');
+    document.getElementById('fStage').innerHTML='<option value="">All stages</option>'+STAGES.map(s=>`<option>${s}</option>`).join('');
+    document.getElementById('fJob').innerHTML='<option value="">All jobs</option>'+
+      jobs.map(j=>`<option value="${esc(j["Job ID"])}">${esc(j["Job ID"])} · ${esc(j["Job Title"])}</option>`).join('');
+  }
+  const starsFor = r => { let n=parseInt(r["Stars"]); if(!n){ const s=sc(r); n=s?Math.max(1,Math.round(s/20)):0; } return Math.min(5,n); };
+  const r10For   = r => { let v=parseFloat(r["Rating10"]); if(isNaN(v)){ const s=sc(r); v=s?Math.round(s/10*10)/10:0; } return v; };
+  const starHTML = n => `<span class="stars">${'★'.repeat(n)}<span class="off">${'★'.repeat(5-n)}</span></span>`;
+  const r10Badge = v => v?`<span class="r10" style="background:${scoreColor(v*10)}">${v}</span>`:'—';
+
+  function setCandView(v){ candView=v;
+    document.getElementById('vList').classList.toggle('active',v==='list');
+    document.getElementById('vGrid').classList.toggle('active',v==='grid');
+    document.getElementById('candList').style.display = v==='list'?'block':'none';
+    document.getElementById('candGrid').style.display = v==='grid'?'grid':'none';
+    renderCands();
+  }
+  function toggleSelectAll(cb){ getFilteredRows().forEach(r=>cb.checked?selected.add(r.rowNumber):selected.delete(r.rowNumber)); renderCands(); }
+  function onSel(rn,cb){ cb.checked?selected.add(rn):selected.delete(rn); }
+
+  function getFilteredRows(){
+    const q=(document.getElementById('search').value||'').toLowerCase();
+    const fst=document.getElementById('fStage').value, fsr=document.getElementById('fSource').value,
+          fjb=document.getElementById('fJob').value, sort=document.getElementById('sort').value;
+    let rows=allData.filter(r=>{
+      const hay=[r["Candidate Name"],r["Role"],r["Current Company"],r["Mail Id"],r["Designation"],r["Remarks"],r["Score Notes"]].map(S).join(' ').toLowerCase();
+      return (!q||hay.includes(q))&&(!fst||r["Candidate Status"]===fst)&&(!fsr||r["Source"]===fsr)&&(!fjb||S(r["Tagged Job"])===S(fjb));
+    });
+    if(sort==="score")rows.sort((a,b)=>sc(b)-sc(a));
+    else if(sort==="stars")rows.sort((a,b)=>starsFor(b)-starsFor(a));
+    else if(sort==="name")rows.sort((a,b)=>S(a["Candidate Name"]).localeCompare(S(b["Candidate Name"])));
+    return rows;
+  }
+  function renderCands(){ candView==='grid'?renderGrid():renderList(); }
+
+  function renderList(){
+    const rows=getFilteredRows();
+    document.getElementById('tableBody').innerHTML=rows.map(r=>{
+      const tag=`<span class="status-tag" style="background:${COLORS[r["Candidate Status"]]||'#94a3b8'}">${esc(r["Candidate Status"])||''}</span>`;
+      const s=sc(r); const sChip=s?`<span class="scorechip" style="background:${scoreColor(s)}">${s}</span>`:'—';
+      const cv=r["Resume"]?`<a href="${r["Resume"]}" target="_blank">View</a>`:'—';
+      const job=r["Tagged Job"]?`<span class="tagchip">${esc(r["Tagged Job"])}</span>`:'—';
+      const chk=`<input type="checkbox" ${selected.has(r.rowNumber)?'checked':''} onclick="onSel(${r.rowNumber},this)">`;
+      const act=canEdit()?`<button class="abtn btn-edit" onclick="editRecord(${r.rowNumber})">Edit</button><button class="abtn btn-delete" onclick="deleteRecord(${r.rowNumber})">Delete</button>`:'<span class="hint">read-only</span>';
+      return `<tr class="${r.__dupe?'dupe-row':''}">
+        <td>${chk}</td>
+        <td>${esc(r["Candidate Name"])||''}${r.__dupe?' <span class="badge">dup</span>':''}</td>
+        <td>${sChip}</td><td>${starHTML(starsFor(r))} ${r10Badge(r10For(r))}</td>
+        <td>${esc(r["Role"])||''}</td><td>${esc(r["Current Company"])||'—'}</td><td>${tag}</td>
+        <td>${job}</td><td>${esc(r["Department"])||''}</td><td>${esc(r["Contact No"])||''}</td>
+        <td>${cv}</td><td><button class="abtn btn-edit" onclick="downloadProfile(${r.rowNumber})">↓ HTML</button></td>
+        <td>${act}</td></tr>`;
+    }).join('');
+  }
+
+  function renderGrid(){
+    const rows=getFilteredRows();
+    document.getElementById('candGrid').innerHTML=rows.map(r=>{
+      const ini=(S(r["Candidate Name"]).split(' ').map(x=>x[0]).join('').substring(0,2)||'CV').toUpperCase();
+      const s=sc(r);
+      const job=r["Tagged Job"]?`<span class="tagchip">${esc(r["Tagged Job"])}</span>`:'';
+      const cv=r["Resume"]?`<a href="${r["Resume"]}" target="_blank" class="btn-ghost">CV ↗</a>`:'';
+      const ed=canEdit()?`<button class="btn-edit" onclick="editRecord(${r.rowNumber})">Edit</button>`:'';
+      return `<div class="ccard ${r.__dupe?'dupe-row':''}">
+        <input class="sel" type="checkbox" ${selected.has(r.rowNumber)?'checked':''} onclick="onSel(${r.rowNumber},this)">
+        <div class="top"><div class="ava">${esc(ini)}</div>
+          <div><div class="nm">${esc(r["Candidate Name"])||'—'}</div><div class="rl">${esc(r["Role"])||''}</div></div></div>
+        <div class="co">🏢 ${esc(r["Current Company"])||'—'}</div>
+        <div class="row"><span>${starHTML(starsFor(r))}</span><span>${r10Badge(r10For(r))} ${s?`<span class="scorechip" style="background:${scoreColor(s)}">${s}</span>`:''}</span></div>
+        <div class="row"><span class="status-tag" style="background:${COLORS[r["Candidate Status"]]||'#94a3b8'}">${esc(r["Candidate Status"])||''}</span>${job}</div>
+        <div class="cbtns">${cv}<button class="btn-ghost" onclick="downloadProfile(${r.rowNumber})">Profile</button>${ed}</div>
+      </div>`;
+    }).join('') || '<p class="hint">No candidates match.</p>';
+  }
+
+  // CRUD
+  function saveRecord(action){
+    if(!canEdit())return alert("Your role is read-only.");
+    showLoading(true);
+    let url=`${API_URL}?action=${action}&sheetName=${encodeURIComponent(TARGET_TAB)}`;
+    if(action==='update')url+=`&rowNumber=${document.getElementById('rowNumber').value}`;
+    fields.forEach(f=>{const el=document.getElementById(f); if(el)url+=`&${encodeURIComponent(f)}=${encodeURIComponent(el.value)}`;});
+    fetch(url,{method:'GET',redirect:'follow'}).then(r=>r.json())
+      .then(res=>{alert(res.message);resetForm();fetchData();sv('pipe',document.querySelector('.tab[data-v="pipe"]'));})
+      .catch(e=>{console.error(e);showLoading(false);});
+  }
+  function editRecord(rn){
+    const r=allData.find(x=>x.rowNumber===rn); if(!r)return;
+    if(!canEdit()){ sv('cands',document.querySelector('.tab[data-v="cands"]')); return; }
+    sv('add',document.querySelector('.tab[data-v="add"]'));
+    document.getElementById('rowNumber').value=rn; document.getElementById('Resume').value=r["Resume"]||'';
+    document.getElementById('Profile JSON').value=r["Profile JSON"]||'';
+    document.getElementById('Tagged Job').value=r["Tagged Job"]||'';
+    fields.forEach(f=>{const el=document.getElementById(f); if(el && el.type!=='hidden')el.value=(r[f]!==undefined?r[f]:(f==="Position ID"?pos(r):''))||'';});
+    const js=document.getElementById('jobSelect'); if(js) js.value=S(r["Tagged Job"]);
+    renderStarPicker(parseInt(r["Stars"])||0);
+    document.getElementById('submitBtn').style.display='none';
+    document.getElementById('updateBtn').style.display='inline-block';
+    document.getElementById('cancelBtn').style.display='inline-block';
+    document.getElementById('scorebox').style.display='none'; window.scrollTo({top:0,behavior:'smooth'});
+  }
+  function deleteRecord(rn){ if(!canEdit())return; if(!confirm("Confirm record deletion?"))return; showLoading(true);
+    fetch(`${API_URL}?action=delete&sheetName=${encodeURIComponent(TARGET_TAB)}&rowNumber=${rn}`,{method:'GET',redirect:'follow'})
+      .then(r=>r.json()).then(res=>{alert(res.message);fetchData();}).catch(e=>{console.error(e);showLoading(false);}); }
+  function resetForm(){
+    document.getElementById('candidateForm').reset();
+    ['rowNumber','Resume','Profile JSON','Tagged Job'].forEach(i=>document.getElementById(i).value='');
+    ['parseStatus','scoreStatus'].forEach(i=>document.getElementById(i).innerText='');
+    const js=document.getElementById('jobSelect'); if(js) js.value='';
+    document.getElementById('resumeFile').value=''; document.getElementById('scorebox').style.display='none';
+    document.getElementById('dupeWarn').style.display='none'; renderStarPicker(0);
+    document.getElementById('submitBtn').style.display='inline-block';
+    document.getElementById('updateBtn').style.display='none'; document.getElementById('cancelBtn').style.display='none';
+  }
+  function checkDupe(){
+    const em=(document.getElementById('Mail Id').value||'').toLowerCase().trim();
+    const ph=(document.getElementById('Contact No').value||'').trim();
+    const cur=document.getElementById('rowNumber').value;
+    const hit=allData.find(r=>String(r.rowNumber)!==cur && ((em&&S(r["Mail Id"]).toLowerCase().trim()===em)||(ph&&S(r["Contact No"]).trim()===ph)));
+    const w=document.getElementById('dupeWarn');
+    if(hit){ w.style.display='block'; w.innerText=`Possible duplicate: ${hit["Candidate Name"]||'existing record'} already has this email/phone (row ${hit.rowNumber}).`; }
+    else w.style.display='none';
+  }
+
+  // resume parse / store / score  — text extracted in-browser (light on API quota)
+  if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js';
+  let extractCache = { name:null, text:null }; // avoid re-extracting for parse + score of same file
+
+  function onFilePicked(){const f=document.getElementById('resumeFile').files[0];
+    extractCache={name:null,text:null};
+    document.getElementById('parseStatus').innerHTML=f?`<span class="pill">${f.name} ready</span>`:'';}
+  function toBase64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.onerror=()=>rej(new Error("read failed"));r.readAsDataURL(file);});}
+  function postJSON(p){return fetch(API_URL,{method:'POST',redirect:'follow',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(p)}).then(r=>r.json());}
+
+  // ── Gemini called FROM THE BROWSER — same path your standalone parser uses (not via Apps Script). ──
+  const GEMINI_MODEL_C = "gemini-flash-latest";
+  async function gemini(parts){
+    const key=(document.getElementById('apiKey').value||REMOTE_KEY||localStorage.getItem('geminiKey')||'').trim();
+    if(!key) throw new Error("No Gemini key found. Set it in Apps Script ▸ Script Properties (GEMINI_KEY), or type one in the field above.");
+    const res=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL_C}:generateContent`,{
+      method:'POST', headers:{'Content-Type':'application/json','X-goog-api-key':key},
+      body:JSON.stringify({contents:[{parts}],generationConfig:{responseMimeType:"application/json",temperature:0.2}})
+    });
+    const j=await res.json();
+    if(!res.ok) throw new Error(j.error?.message || ("HTTP "+res.status));
+    return JSON.parse(j.candidates[0].content.parts[0].text);
+  }
+  const P_PARSE='Parse the resume and return ONLY JSON (empty string if a field is absent, no markdown): '
+    +'{"Candidate Name":"","Mail Id":"","Contact No":"","Designation":"","Department":"","Role":"","Source":"","Skills":"","Summary":"","current_company":"","linkedin_url":"",'
+    +'"experience":[{"company":"","role":"","start_year":"","end_year":"","duration":"","description":""}],'
+    +'"education":[{"institution":"","degree":"","year":""}]}. '
+    +'"Role"=most recent/senior title. "Designation"=current title. "Department"=function area. "current_company"=present employer. '
+    +'"Skills"=comma-separated. "Summary"=one sentence. Parse start_year/end_year as clean years ("Present" allowed).';
+  const P_SCORE_ADDON=' Also append to the SAME JSON object: "score" (integer 0-100 match vs the JD), "verdict" (one short line), "strengths" (array of up to 4), "gaps" (array of up to 4).';
+  const P_SCORE='Score the resume against the JOB DESCRIPTION. Return ONLY JSON: {"score":0,"verdict":"","strengths":["",""],"gaps":["",""]}. "score"=integer 0-100. No markdown.';
+  const P_KIT='Build a first-round screening kit for the role/JD. Return ONLY JSON: {"questions":[{"q":"","focus":""}],"scorecard":[{"criterion":"","weight":""}]}. 6-8 role-specific questions each with a 1-3 word focus; 4-6 scorecard criteria with percentage weights summing to ~100%. No markdown.';
+
+  function buildParts(prompt, text, f, data){
+    return text ? [{text: prompt + "\n\nRESUME TEXT:\n" + text}]
+                : [{inline_data:{mime_type:f.type||"application/pdf", data:data}}, {text: prompt}];
+  }
+
+  async function extractText(file){
+    if(extractCache.name===file.name && extractCache.text) return extractCache.text;
+    const buf = await file.arrayBuffer(); let text="";
+    if(file.name.toLowerCase().endsWith('.pdf')){
+      const pdf = await pdfjsLib.getDocument({data:buf}).promise;
+      for(let i=1;i<=pdf.numPages;i++){ const pg=await pdf.getPage(i); const c=await pg.getTextContent();
+        text += c.items.map(it=>it.str).join(" ")+"\n"; }
+    } else if(file.name.toLowerCase().endsWith('.docx')){
+      text = (await mammoth.extractRawText({arrayBuffer:buf})).value;
+    } else {
+      // images / scanned PDFs without a text layer: fall back to sending the file to the AI
+      return null;
+    }
+    if(!text.trim()) return null;          // scanned PDF with no text layer -> fallback
+    extractCache={name:file.name,text:text};
+    return text;
+  }
+
+  function applyParsed(p){
+    setVal("Candidate Name",p["Candidate Name"]);setVal("Mail Id",p["Mail Id"]);setVal("Contact No",p["Contact No"]);
+    setVal("Designation",p["Designation"]);setVal("Department",p["Department"]);setVal("Role",p["Role"]);
+    if(p["Source"])setVal("Source",p["Source"]);
+    const company=p["current_company"]||(p.experience&&p.experience[0]&&p.experience[0].company); if(company)setVal("Current Company",company);
+    const note=[p["Summary"],p["Skills"]?("Skills: "+p["Skills"]):""].filter(Boolean).join(" — "); if(note)setVal("Remarks",note);
+    document.getElementById('Profile JSON').value = JSON.stringify(p).slice(0,49000); // store rich profile for HTML export
+    checkDupe();
+  }
+
+  async function parseSelectedResume(){
+    const f=document.getElementById('resumeFile').files[0]; const st=document.getElementById('parseStatus');
+    if(!f){st.style.color="#ef4444";st.innerText="Pick a resume file first.";return;}
+    try{
+      st.style.color="#4338ca";st.innerText="Reading document…";
+      const text=await extractText(f);
+      const data=text?null:await toBase64(f);             // only need base64 if no text layer
+      const jd=(document.getElementById('jd').value||'').trim();
+      st.innerText = jd ? "Parsing & scoring with AI…" : "Parsing with AI…";
+      const prompt = jd ? (P_PARSE + P_SCORE_ADDON + "\n\nJOB DESCRIPTION:\n" + jd) : P_PARSE;
+      const p = await gemini(buildParts(prompt, text, f, data));   // ← browser call
+      applyParsed(p);
+      if(jd && p.score!==undefined) showScore(p);
+      st.innerText="Saving original to Drive…";
+      const driveData = data || await toBase64(f);
+      const up=await postJSON({action:"uploadResume",fileData:driveData,mimeType:f.type||"application/pdf",fileName:f.name});
+      if(up.status==="success"&&up.link)document.getElementById('Resume').value=up.link;
+      st.style.color="#16a34a";
+      st.innerHTML=`Parsed & stored. ${up.link?'<a class="cv" href="'+up.link+'" target="_blank" style="color:var(--brand);font-weight:600">View CV ↗</a>':''} Review, then Register.`;
+    }catch(err){console.error(err);st.style.color="#ef4444";st.innerText="Failed: "+err.message;}
+  }
+
+  async function scoreSelectedResume(){
+    const f=document.getElementById('resumeFile').files[0]; const st=document.getElementById('scoreStatus');
+    if(!f){st.style.color="#ef4444";st.innerText="Pick a resume file first.";return;}
+    const jd=(document.getElementById('jd').value||'').trim();
+    if(!jd){st.style.color="#ef4444";st.innerText="Paste a job description first.";return;}
+    try{
+      st.style.color="#4338ca";st.innerText="Scoring against JD…";
+      const text=await extractText(f); const data=text?null:await toBase64(f);
+      const d=await gemini(buildParts(P_SCORE + "\n\nJOB DESCRIPTION:\n" + jd, text, f, data));   // ← browser call
+      showScore(d);
+      st.style.color="#16a34a";st.innerText="Scored — saved to the AI Score field.";
+    }catch(err){console.error(err);st.style.color="#ef4444";st.innerText="Failed: "+err.message;}
+  }
+
+  function showScore(d){
+    setVal("AI Score",d.score); setVal("Score Notes",(d.verdict||"")+(d.gaps&&d.gaps.length?(" | Gaps: "+d.gaps.join("; ")):""));
+    syncRatings();
+    const box=document.getElementById('scorebox'); box.style.display='block';
+    box.innerHTML=`<div class="scorehead"><div class="ring" style="background:${scoreColor(d.score)}">${d.score||0}</div>
+      <div><strong>${esc(d.verdict||'Assessed')}</strong> ${starHTML(Math.min(5,Math.max(1,Math.round((d.score||0)/20))))}<div class="hint" style="margin:0">AI match vs job description</div></div></div>
+      <div class="cols2"><div><strong>Strengths</strong><ul>${(d.strengths||[]).map(x=>`<li>${esc(x)}</li>`).join('')||'<li>—</li>'}</ul></div>
+      <div><strong>Gaps</strong><ul>${(d.gaps||[]).map(x=>`<li>${esc(x)}</li>`).join('')||'<li>—</li>'}</ul></div></div>`;
+  }
+
+  // ── ratings ──
+  function syncRatings(){
+    const s=parseInt(document.getElementById('AI Score').value)||0;
+    if(s){ setVal("Rating10",Math.round(s/10*10)/10); renderStarPicker(Math.min(5,Math.max(1,Math.round(s/20)))); }
+  }
+  function renderStarPicker(n){
+    document.getElementById('Stars').value=n||'';
+    const el=document.getElementById('starPick'); if(!el)return;
+    el.innerHTML=[1,2,3,4,5].map(i=>`<span class="${i<=n?'on':''}" onclick="setStars(${i})">★</span>`).join('');
+  }
+  function setStars(n){ renderStarPicker(n); setVal("Rating10",n*2); }
+
+  // ── job postings ──
+  function buildJobDropdowns(){
+    const opts='<option value="">— none —</option>'+jobs.map(j=>`<option value="${esc(j["Job ID"])}">${esc(j["Job ID"])} · ${esc(j["Job Title"])}${j["Status"]&&j["Status"]!=="Open"?" ("+esc(j["Status"])+")":""}</option>`).join('');
+    const js=document.getElementById('jobSelect'); if(js){const v=js.value; js.innerHTML=opts; js.value=v;}
+  }
+  function onJobPicked(){
+    const id=document.getElementById('jobSelect').value; const j=jobById(id);
+    document.getElementById('Tagged Job').value=id||'';
+    if(j){ if(j["JD"])document.getElementById('jd').value=j["JD"];
+      setVal("Role",j["Job Title"]); setVal("Department",j["Department"]); setVal("Position ID",j["Job ID"]); }
+  }
+  function renderJobs(){
+    const counts={}; allData.forEach(c=>{const t=S(c["Tagged Job"]); if(t)counts[t]=(counts[t]||0)+1;});
+    document.getElementById('jobsBody').innerHTML = jobs.length? jobs.map(j=>{
+      const act=canEdit()?`<button class="abtn btn-edit" onclick="editJob(${j.rowNumber})">Edit</button><button class="abtn btn-delete" onclick="deleteJob(${j.rowNumber})">Delete</button>`:'—';
+      return `<tr><td><span class="tagchip">${esc(j["Job ID"])}</span></td><td>${esc(j["Job Title"])}</td><td>${esc(j["Department"])||''}</td>
+        <td>${esc(j["Hiring Manager"])||'—'}${j["HM Email"]?'<br><span class="hint">'+esc(j["HM Email"])+'</span>':''}</td>
+        <td>${esc(j["HOD"])||'—'}${j["HOD Email"]?'<br><span class="hint">'+esc(j["HOD Email"])+'</span>':''}</td>
+        <td>${esc(j["Status"])||''}</td><td>${counts[S(j["Job ID"])]||0}</td><td>${act}</td></tr>`;
+    }).join('') : '<tr><td colspan="8" class="hint">No postings yet — create one above.</td></tr>';
+  }
+  function jobEl(h){ return document.getElementById(h==="Department"?"Job Department":h); }
+  function saveJob(action){
+    if(!canEdit())return alert("Your role is read-only.");
+    const id=document.getElementById('Job ID').value, title=document.getElementById('Job Title').value;
+    if(!id||!title)return alert("Job ID and Title are required.");
+    showLoading(true);
+    let url=`${API_URL}?action=${action}&sheetName=${encodeURIComponent(JOBS_TAB)}`;
+    if(action==='update')url+=`&rowNumber=${document.getElementById('jobRow').value}`;
+    jobFields.forEach(h=>{const el=jobEl(h); if(el)url+=`&${encodeURIComponent(h)}=${encodeURIComponent(el.value)}`;});
+    if(action==='create')url+=`&Posted Date=${encodeURIComponent(new Date().toISOString().slice(0,10))}`;
+    fetch(url,{method:'GET',redirect:'follow'}).then(r=>r.json())
+      .then(res=>{alert(res.message);resetJobForm();fetchData();}).catch(e=>{console.error(e);showLoading(false);});
+  }
+  function editJob(rn){ const j=jobs.find(x=>x.rowNumber===rn); if(!j)return;
+    document.getElementById('jobRow').value=rn;
+    jobFields.forEach(h=>{const el=jobEl(h); if(el)el.value=j[h]||'';});
+    document.getElementById('jobSubmit').style.display='none';
+    document.getElementById('jobUpdate').style.display='inline-block';
+    document.getElementById('jobCancel').style.display='inline-block';
+    window.scrollTo({top:0,behavior:'smooth'});
+  }
+  function deleteJob(rn){ if(!canEdit())return; if(!confirm("Delete this posting?"))return; showLoading(true);
+    fetch(`${API_URL}?action=delete&sheetName=${encodeURIComponent(JOBS_TAB)}&rowNumber=${rn}`,{method:'GET',redirect:'follow'})
+      .then(r=>r.json()).then(res=>{alert(res.message);fetchData();}).catch(e=>{console.error(e);showLoading(false);}); }
+  function resetJobForm(){ document.getElementById('jobForm').reset(); document.getElementById('jobRow').value='';
+    document.getElementById('jobSubmit').style.display='inline-block';
+    document.getElementById('jobUpdate').style.display='none'; document.getElementById('jobCancel').style.display='none'; }
+
+  // ── auto-tag best job (one AI call against all open postings) ──
+  async function autoTagBestJob(){
+    const st=document.getElementById('scoreStatus');
+    const open=jobs.filter(j=>!j["Status"]||j["Status"]==="Open");
+    if(!open.length){st.style.color="#ef4444";st.innerText="No open job postings to match against.";return;}
+    const f=document.getElementById('resumeFile').files[0];
+    let text = f ? await extractText(f) : null;
+    if(!text){ text = [document.getElementById('Role').value, document.getElementById('Designation').value,
+      document.getElementById('Remarks').value, document.getElementById('Profile JSON').value].filter(Boolean).join(' '); }
+    if(!text.trim()){st.style.color="#ef4444";st.innerText="Add a resume or parse first so there's something to match.";return;}
+    try{
+      st.style.color="#4338ca";st.innerText="Matching candidate to open jobs…";
+      const list=open.map(j=>`- ${j["Job ID"]}: ${j["Job Title"]} | ${S(j["JD"]).slice(0,500)}`).join("\n");
+      const prompt='You match a candidate to the best-fit job. Return ONLY JSON: {"job_id":"","score":0,"verdict":"","remarks":""}. '
+        +'"job_id"=the best matching Job ID from the list (exact). "score"=0-100 fit. "remarks"=one line why.\n\nJOBS:\n'+list
+        +'\n\nCANDIDATE:\n'+text.slice(0,6000);
+      const d=await gemini([{text:prompt}]);
+      const j=jobById(d.job_id);
+      document.getElementById('Tagged Job').value=d.job_id||'';
+      const js=document.getElementById('jobSelect'); if(js) js.value=S(d.job_id);
+      if(j){ setVal("Role",j["Job Title"]); setVal("Department",j["Department"]); setVal("Position ID",j["Job ID"]); if(j["JD"])document.getElementById('jd').value=j["JD"]; }
+      setVal("AI Score",d.score); setVal("Score Notes",d.verdict?`${d.verdict} — ${d.remarks||''}`:(d.remarks||'')); syncRatings();
+      st.style.color="#16a34a";st.innerText=`Tagged to ${d.job_id||'—'} (${d.score||0}% fit).`;
+    }catch(err){console.error(err);st.style.color="#ef4444";st.innerText="Match failed: "+err.message;}
+  }
+
+  // ── HTML profile generation ──
+  function profileFromRecord(r){
+    let p={}; try{ p=JSON.parse(r["Profile JSON"]||"{}"); }catch(e){}
+    return {
+      name:r["Candidate Name"]||p["Candidate Name"]||"Candidate",
+      headline:r["Role"]||p["Role"]||p["headline"]||r["Designation"]||"",
+      company:r["Current Company"]||p["current_company"]||"",
+      email:r["Mail Id"]||p["Mail Id"]||"", phone:r["Contact No"]||p["Contact No"]||"",
+      linkedin:p["linkedin_url"]||"", summary:p["Summary"]||r["Remarks"]||"",
+      skills:(p["Skills"]||"").split(',').map(x=>x.trim()).filter(Boolean),
+      experience:p.experience||[], education:p.education||[],
+      score:sc(r), stars:starsFor(r), r10:r10For(r),
+      job:r["Tagged Job"]||"", remarks:r["Score Notes"]||"", status:r["Candidate Status"]||""
+    };
+  }
+  function profileHTML(d){
+    const ini=(d.name.split(' ').map(x=>x[0]).join('').substring(0,2)||'CV').toUpperCase();
+    const stars='★'.repeat(d.stars)+'☆'.repeat(5-d.stars);
+    const skills=d.skills.map(s=>`<span class="tag">${esc(s)}</span>`).join('')||'—';
+    const exp=d.experience.map(e=>`<div class="ti"><div class="tf">${esc(e.duration||((e.start_year||'')+' – '+(e.end_year||'')))}</div><div class="rt">${esc(e.role||'')}</div><div class="cn">${esc(e.company||'')}</div><p>${esc(e.description||'')}</p></div>`).join('')||'<p>—</p>';
+    const edu=d.education.map(e=>`<div class="edu"><b>${esc(e.degree||'')}</b><br>${esc(e.institution||'')}<br><span class="yr">${esc(e.year||'')}</span></div>`).join('')||'<p>—</p>';
+    const jobLine=d.job?`<span class="pill">Matched to ${esc(d.job)}</span>`:'';
+    return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${esc(d.name)} — Profile</title><style>
+      body{font-family:-apple-system,Segoe UI,Arial,sans-serif;max-width:820px;margin:30px auto;padding:0 20px;color:#1e293b}
+      .hd{display:flex;gap:22px;align-items:center;border-bottom:1px solid #e2e8f0;padding-bottom:20px}
+      .av{width:84px;height:84px;border-radius:50%;background:linear-gradient(135deg,#4338ca,#7c3aed);color:#fff;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:800}
+      h1{margin:0;font-size:24px}.sub{color:#64748b;margin:4px 0}
+      .badges span{display:inline-block;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:20px;padding:4px 12px;font-size:13px;margin:4px 6px 0 0}
+      .pill{background:#eef2ff;color:#4338ca;border-color:#c7d2fe}
+      .matchbox{display:flex;gap:18px;align-items:center;background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:16px;margin:18px 0}
+      .ring{width:64px;height:64px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;font-size:18px;background:${scoreColor(d.score)}}
+      .stars{color:#f59e0b;font-size:22px}.r10{font-weight:800;color:#0f172a}
+      h2{font-size:15px;text-transform:uppercase;letter-spacing:.05em;border-left:4px solid #4338ca;padding-left:10px;margin:26px 0 12px}
+      .tag{display:inline-block;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:8px;padding:5px 12px;font-size:13px;margin:0 6px 6px 0}
+      .ti{border-left:2px solid #e2e8f0;padding:0 0 14px 16px;margin-left:4px;position:relative}
+      .ti:before{content:'';position:absolute;left:-7px;top:3px;width:11px;height:11px;border-radius:50%;background:#4338ca;border:2px solid #fff}
+      .tf{font-size:12px;font-weight:700;color:#4338ca}.rt{font-weight:700}.cn{color:#64748b;font-size:13px}.ti p{font-size:13px;color:#475569;margin:6px 0 0}
+      .edu{border:1px solid #e2e8f0;border-radius:10px;padding:12px;margin-bottom:10px;background:#f8fafc;font-size:13px}.yr{color:#4338ca;font-weight:700}
+      @media print{.matchbox,.tag,.edu,.badges span{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+    </style></head><body>
+      <div class="hd"><div class="av">${esc(ini)}</div><div>
+        <h1>${esc(d.name)}</h1><div class="sub">${esc(d.headline)}${d.company?' · '+esc(d.company):''}</div>
+        <div class="badges">${d.email?'<span>✉ '+esc(d.email)+'</span>':''}${d.phone?'<span>📞 '+esc(d.phone)+'</span>':''}${d.linkedin?'<span class="pill">🔗 LinkedIn</span>':''}${jobLine}</div>
+      </div></div>
+      <div class="matchbox"><div class="ring">${d.score||0}</div>
+        <div><div class="stars">${stars}</div><div class="r10">Rating ${d.r10}/10</div></div>
+        <div style="flex:1;font-size:13px;color:#475569"><b>AI matching remarks:</b><br>${esc(d.remarks)||'—'}</div></div>
+      <h2>Summary</h2><p style="font-size:14px;color:#475569">${esc(d.summary)||'—'}</p>
+      <h2>Skills</h2><div>${skills}</div>
+      <h2>Experience</h2>${exp}
+      <h2>Education</h2>${edu}
+      <p style="color:#94a3b8;font-size:11px;margin-top:30px">Generated by TalentPool ATS · ${new Date().toLocaleDateString()}</p>
+    </body></html>`;
+  }
+  function downloadHTML(filename, html){
+    const blob=new Blob([html],{type:'text/html'}); const url=URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); setTimeout(()=>URL.revokeObjectURL(url),2000);
+  }
+  function downloadProfile(rn){ const r=allData.find(x=>x.rowNumber===rn); if(!r)return;
+    const d=profileFromRecord(r); downloadHTML(`${S(d.name).replace(/[^\w]+/g,'_')}_Profile.html`, profileHTML(d)); }
+  function downloadProfileFromForm(){
+    const r={}; fields.forEach(f=>{const el=document.getElementById(f); if(el)r[f]=el.value;});
+    r["Profile JSON"]=document.getElementById('Profile JSON').value;
+    if(!r["Candidate Name"])return alert("Nothing to export yet — parse or fill the form first.");
+    const d=profileFromRecord(r); downloadHTML(`${S(d.name).replace(/[^\w]+/g,'_')}_Profile.html`, profileHTML(d));
+  }
+
+  // ── share selected candidates (preconfigured table + remarks bundle) ──
+  function shareSelected(){
+    const rows=allData.filter(r=>selected.has(r.rowNumber));
+    if(!rows.length)return alert("Tick at least one candidate to share.");
+    const head=['Name','Role','Current Co.','Match','Rating','Stars','Status','Tagged Job','CV','AI remarks'];
+    const body=rows.map(r=>{
+      const d=profileFromRecord(r);
+      const cv=r["Resume"]?`<a href="${r["Resume"]}">CV</a>`:'—';
+      return `<tr><td>${esc(d.name)}</td><td>${esc(r["Role"])||''}</td><td>${esc(d.company)||'—'}</td>
+        <td><b style="color:${scoreColor(d.score)}">${d.score}</b></td><td>${d.r10}/10</td>
+        <td style="color:#f59e0b">${'★'.repeat(d.stars)}${'☆'.repeat(5-d.stars)}</td>
+        <td>${esc(r["Candidate Status"])||''}</td><td>${esc(r["Tagged Job"])||'—'}</td><td>${cv}</td><td>${esc(d.remarks)||'—'}</td></tr>`;
+    }).join('');
+    const jset=[...new Set(rows.map(r=>S(r["Tagged Job"])).filter(Boolean))].map(jobById).filter(Boolean);
+    const contacts=jset.map(j=>`${esc(j["Job Title"])}: HM ${esc(j["Hiring Manager"]||'—')} <${esc(j["HM Email"]||'')}>, HOD ${esc(j["HOD"]||'—')} <${esc(j["HOD Email"]||'')}>`).join('<br>');
+    const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Candidate shortlist</title><style>
+      body{font-family:-apple-system,Segoe UI,Arial,sans-serif;max-width:1000px;margin:24px auto;padding:0 16px;color:#1e293b}
+      h1{font-size:20px}table{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
+      th,td{border:1px solid #e2e8f0;padding:8px 10px;text-align:left}th{background:#0d1426;color:#fff}
+      .meta{background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px;font-size:13px;margin:12px 0}
+      a{color:#4338ca}</style></head><body>
+      <h1>Candidate shortlist (${rows.length})</h1>
+      ${contacts?`<div class="meta"><b>Tagged hiring contacts</b><br>${contacts}</div>`:''}
+      <table><thead><tr>${head.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${body}</tbody></table>
+      <p style="color:#94a3b8;font-size:11px;margin-top:20px">Shared from TalentPool ATS · ${new Date().toLocaleString()} · open candidate CVs via the links; full HTML profiles available per candidate.</p>
+    </body></html>`;
+    const w=window.open('','_blank'); if(w){ w.document.write(html); w.document.close(); }
+    downloadHTML(`shortlist_${rows.length}_candidates.html`, html);
+  }
+
+  // interview kit
+  async function generateKit(){
+    const st=document.getElementById('kitStatus'); const out=document.getElementById('kitOut');
+    const role=document.getElementById('kitRole').value;
+    if(!role&&!document.getElementById('kitJd').value){st.style.color="#ef4444";st.innerText="Enter a role or JD first.";return;}
+    try{ st.style.color="#4338ca";st.innerText="Building screening kit…"; out.innerHTML="";
+      const jd=document.getElementById('kitJd').value||"";
+      const d=await gemini([{text: P_KIT + "\n\nROLE: " + role + "\n\nJOB DESCRIPTION:\n" + jd}]);   // ← browser call
+      out.innerHTML=`<h3 class="sec" style="margin-top:18px">Screening questions</h3>
+        ${(d.questions||[]).map(q=>`<div class="kit-q"><div class="focus">${esc(q.focus||'general')}</div>${esc(q.q)}</div>`).join('')}
+        <h3 class="sec" style="margin-top:18px">Scorecard</h3>
+        ${(d.scorecard||[]).map(s=>`<div class="sc-row"><span>${esc(s.criterion)}</span><span class="badge">${esc(s.weight)}</span></div>`).join('')}`;
+      st.style.color="#16a34a";st.innerText="Kit ready.";
+    }catch(err){console.error(err);st.style.color="#ef4444";st.innerText="Failed: "+err.message;}
+  }
+
+  function scoreColor(s){s=parseInt(s)||0; return s>=75?'#16a34a':s>=50?'#f59e0b':'#ef4444';}
+  function S(v){return v==null?'':String(v);}   // sheet cells can be numbers/dates — coerce before string ops
+  function setVal(id,v){const el=document.getElementById(id); if(el&&v!==undefined&&v!=='')el.value=v;}
+  function esc(s){return s==null?'':String(s).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));}
+  function logout(){localStorage.removeItem("portalSession");localStorage.removeItem("portalUser");localStorage.removeItem("portalRole");window.location.href="login.html";}
+</script>
+</body>
+</html>
