@@ -1,0 +1,329 @@
+/**
+ * TalentPool ATS — Google Apps Script backend
+ * Bound to your OPERATIONAL spreadsheet (the one holding the "Candidate" tab).
+ *
+ * Actions:
+ *   login            -> reads username / password / role from a SEPARATE Auth spreadsheet (by ID)
+ *   read/create/update/delete -> generic CRUD (maps by Row-1 headers)
+ *   parseResume      -> Gemini extracts structured candidate fields from a resume file
+ *   scoreResume      -> Gemini scores & ranks a resume against a job description (AI shortlisting)
+ *   generateKit      -> Gemini builds role-based screening questions + a structured scorecard
+ *   uploadResume     -> stores the file in Drive, returns a shareable link
+ *
+ * SECURITY: the Gemini key lives here, on the server. It is NEVER sent to the browser.
+ */
+
+// ───────── CONFIG ─────────
+const AUTH_SHEET_ID = "PASTE_YOUR_SEPARATE_AUTH_SPREADSHEET_ID_HERE"; // the OTHER spreadsheet
+const AUTH_TAB_NAME = "Auth";                 // col A=username, col B=password, col C=role (optional)
+const GEMINI_MODEL  = "gemini-flash-latest";  // same model your standalone parser uses; if 404, check AI Studio
+const RESUME_FOLDER = "ATS Resumes";
+// The key now lives in Script Properties (Project Settings ▸ Script Properties, key name: GEMINI_KEY),
+// or run storeGeminiKey() once. This constant is only a last-resort fallback.
+const GEMINI_KEY_FALLBACK = "";
+// ──────────────────────────
+
+function getGeminiKey() {
+  return PropertiesService.getScriptProperties().getProperty("GEMINI_KEY") || GEMINI_KEY_FALLBACK;
+}
+
+/** Run ONCE from the editor to store the key, then blank the value out again for safety. */
+function storeGeminiKey() {
+  PropertiesService.getScriptProperties().setProperty("GEMINI_KEY", "PASTE_KEY_HERE_THEN_RUN");
+  Logger.log("Stored GEMINI_KEY in Script Properties.");
+}
+
+function doGet(e)  { return handleRequest(e); }
+
+function doPost(e) {
+  if (e && e.postData && e.postData.contents) {
+    try { e.parameter = Object.assign({}, e.parameter, JSON.parse(e.postData.contents)); } catch (err) {}
+  }
+  return handleRequest(e);
+}
+
+function handleRequest(e) {
+  const action = e.parameter.action;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  try {
+    // Frontend fetches the key (stored server-side) after login, then calls Gemini from the browser.
+    if (action === "getConfig") {
+      return json({ status:"success", geminiKey: getGeminiKey(), geminiModel: GEMINI_MODEL });
+    }
+
+    if (action === "login") {
+      let authSS;
+      try { authSS = SpreadsheetApp.openById(AUTH_SHEET_ID); }
+      catch (err) { return json({ status:"error", message:"Cannot open Auth spreadsheet. Check AUTH_SHEET_ID and sharing." }); }
+      const authSheet = authSS.getSheetByName(AUTH_TAB_NAME);
+      if (!authSheet) return json({ status:"error", message:"'" + AUTH_TAB_NAME + "' tab not found in Auth spreadsheet." });
+      const creds = authSheet.getDataRange().getValues();
+      const u = (e.parameter.username || "").trim();
+      const p = (e.parameter.password || "").trim();
+      for (let i = 1; i < creds.length; i++) {
+        if (creds[i][0].toString().trim() === u && creds[i][1].toString().trim() === p) {
+          const role = (creds[i][2] || "Recruiter").toString().trim();
+          return json({ status:"success", message:"Authenticated successfully", user:u, role:role });
+        }
+      }
+      return json({ status:"error", message:"Invalid username or password." });
+    }
+
+    if (action === "parseResume") {
+      const parts = resumeParts(e);          // text if provided, else binary fallback
+      parts.push({ text: PARSE_PROMPT });
+      return json({ status:"success", data: geminiJSON(parts) });
+    }
+
+    if (action === "scoreResume") {
+      const jd = e.parameter.jobDescription || "(no job description provided — assess general quality)";
+      const parts = resumeParts(e);
+      parts.push({ text: SCORE_PROMPT + "\n\nJOB DESCRIPTION:\n" + jd });
+      return json({ status:"success", data: geminiJSON(parts) });
+    }
+
+    // ONE call that extracts fields AND scores — use this to halve quota usage per resume.
+    if (action === "parseAndScore") {
+      const jd = e.parameter.jobDescription || "(no job description provided — score general quality)";
+      const parts = resumeParts(e);
+      parts.push({ text: PARSE_PROMPT + "\n\nAlso append these keys to the SAME JSON object: " +
+        '"score" (0-100 match vs the JD below), "verdict" (one short line), ' +
+        '"strengths" (array), "gaps" (array).\n\nJOB DESCRIPTION:\n' + jd });
+      return json({ status:"success", data: geminiJSON(parts) });
+    }
+
+    if (action === "generateKit") {
+      const role = e.parameter.role || "";
+      const jd = e.parameter.jobDescription || "";
+      return json({ status:"success", data: geminiJSON([
+        { text: KIT_PROMPT + "\n\nROLE: " + role + "\n\nJOB DESCRIPTION:\n" + jd }
+      ]) });
+    }
+
+    if (action === "uploadResume") {
+      return json({ status:"success", link: saveResumeToDrive(e.parameter.fileData, e.parameter.mimeType, e.parameter.fileName || "resume") });
+    }
+
+    // ── CRUD ──
+    const sheetName = e.parameter.sheetName || "Sheet1";
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) return json({ status:"error", message:"Sheet tab '" + sheetName + "' not found." });
+    const values = sheet.getDataRange().getValues();
+    const headers = values[0];
+
+    if (action === "read") {
+      const rows = [];
+      for (let i = 1; i < values.length; i++) {
+        const r = { rowNumber: i + 1 };
+        for (let j = 0; j < headers.length; j++) if (headers[j]) r[headers[j]] = values[i][j];
+        rows.push(r);
+      }
+      return json({ status:"success", data: rows });
+    }
+    if (action === "create") {
+      const newRow = headers.map(h => h === "S.no" ? sheet.getLastRow() : (e.parameter[h] !== undefined ? e.parameter[h] : ""));
+      sheet.appendRow(newRow);
+      return json({ status:"success", message:"Record registered successfully!" });
+    }
+    if (action === "update") {
+      const rn = parseInt(e.parameter.rowNumber); if (!rn) throw new Error("Missing rowNumber.");
+      headers.forEach((h, i) => { if (h !== "S.no" && e.parameter[h] !== undefined) sheet.getRange(rn, i + 1).setValue(e.parameter[h]); });
+      return json({ status:"success", message:"Record updated successfully!" });
+    }
+    if (action === "delete") {
+      const rn = parseInt(e.parameter.rowNumber); if (!rn) throw new Error("Missing rowNumber.");
+      sheet.deleteRow(rn);
+      return json({ status:"success", message:"Record deleted successfully!" });
+    }
+    return json({ status:"error", message:"Action not recognized." });
+
+  } catch (error) {
+    return json({ status:"error", message: error.toString() });
+  }
+}
+
+// ───────── Gemini prompts ─────────
+// Builds the content parts: prefer client-extracted TEXT (light, quota-friendly,
+// the way the standalone parser works). Fall back to the raw file only if no text was sent.
+function resumeParts(e) {
+  if (e.parameter.resumeText && e.parameter.resumeText.trim()) {
+    return [{ text: "RESUME TEXT:\n" + e.parameter.resumeText }];
+  }
+  if (e.parameter.fileData) {
+    return [{ inline_data: { mime_type: e.parameter.mimeType || "application/pdf", data: e.parameter.fileData } }];
+  }
+  throw new Error("No resume text or file supplied.");
+}
+
+const PARSE_PROMPT =
+  'Parse the resume above and return ONLY JSON (empty string if a field is absent, no markdown): ' +
+  '{"Candidate Name":"","Mail Id":"","Contact No":"","Designation":"","Department":"","Role":"","Source":"",' +
+  '"Skills":"","Summary":"","linkedin_url":"",' +
+  '"experience":[{"company":"","role":"","start_year":"","end_year":"","duration":"","description":""}],' +
+  '"education":[{"institution":"","degree":"","year":""}]}. ' +
+  '"Role"=most recent/senior title. "Designation"=current title. "Department"=function area. ' +
+  '"Skills"=comma-separated top skills. "Summary"=one sentence. ' +
+  'Parse start_year and end_year as clean numeric years ("Present" allowed for end_year).';
+
+const SCORE_PROMPT =
+  'You are an AI shortlisting engine. Score this resume against the job description below. ' +
+  'Return ONLY JSON: {"score":0,"verdict":"","strengths":["",""],"gaps":["",""]}. ' +
+  '"score"=integer 0-100 match. "verdict"=one short line (Strong fit / Possible / Weak). ' +
+  '"strengths" and "gaps"=up to 4 concise bullets each. No markdown.';
+
+const KIT_PROMPT =
+  'You are a structured-interview designer. For the role and JD below build a first-round screening kit. ' +
+  'Return ONLY JSON: {"questions":[{"q":"","focus":""}],"scorecard":[{"criterion":"","weight":""}]}. ' +
+  'Provide 6-8 role-specific questions, each with a 1-3 word "focus" tag. ' +
+  'Provide 4-6 scorecard criteria with a percentage weight string that sums to ~100%. No markdown.';
+
+function geminiJSON(parts) {
+  if (!parts || !parts.length) throw new Error("No content for AI.");
+  const payload = { contents: [{ parts: parts }], generationConfig: { temperature: 0.2, responseMimeType: "application/json" } };
+  // Identical auth to the working standalone parser: key goes in the HEADER, not the URL.
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent";
+  const opts = {
+    method: "post",
+    contentType: "application/json",
+    headers: { "X-goog-api-key": getGeminiKey() },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  let res = UrlFetchApp.fetch(url, opts);
+  // One automatic retry for per-minute (RPM) throttling, which clears in a few seconds.
+  if (res.getResponseCode() === 429) { Utilities.sleep(4000); res = UrlFetchApp.fetch(url, opts); }
+
+  const code = res.getResponseCode();
+  if (code === 429) throw new Error(
+    "Gemini returned 429 (quota). Auth is fine — the key's quota pool is drained. " +
+    "This pool is SHARED with your standalone parser, so heavy testing exhausts it for both. " +
+    "Fix: wait for the daily reset, or enable billing on the key's Google Cloud project (free tier caps are very low).");
+  if (code === 400 || code === 401 || code === 403) throw new Error(
+    "Gemini auth error " + code + ": " + res.getContentText().slice(0, 200) +
+    " — check the key is valid/active and that '" + GEMINI_MODEL + "' is available to it.");
+  if (code !== 200) throw new Error("Gemini error " + code + ": " + res.getContentText().slice(0, 300));
+
+  const body = JSON.parse(res.getContentText());
+  const text = body && body.candidates && body.candidates[0] && body.candidates[0].content.parts[0].text;
+  if (!text) throw new Error("Gemini returned no content (response may have been blocked or empty).");
+  return JSON.parse(text);
+}
+
+function saveResumeToDrive(base64Data, mimeType, fileName) {
+  if (!base64Data) throw new Error("No file data for upload.");
+  const folders = DriveApp.getFoldersByName(RESUME_FOLDER);
+  const folder = folders.hasNext() ? folders.next() : DriveApp.createFolder(RESUME_FOLDER);
+  const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyyMMdd_HHmmss");
+  const blob = Utilities.newBlob(Utilities.base64Decode(base64Data), mimeType || "application/pdf", stamp + "_" + fileName);
+  const file = folder.createFile(blob);
+  try { file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch (e) {}
+  return file.getUrl();
+}
+
+function json(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
+
+/**
+ * DIAGNOSTIC — run this directly from the editor (select testGemini → Run) and read View ▸ Logs.
+ * It makes ONE tiny text call so you can see the raw HTTP code with nothing else involved:
+ *   200 = key + quota are good (the ATS will work)
+ *   429 = quota pool is drained — wait for reset or enable billing (no code can fix this)
+ *   400/401/403 = key or model problem
+ */
+function testGemini() {
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent";
+  const res = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    headers: { "X-goog-api-key": getGeminiKey() },
+    payload: JSON.stringify({ contents: [{ parts: [{ text: "Reply with the single word: OK" }] }] }),
+    muteHttpExceptions: true
+  });
+  const out = "HTTP " + res.getResponseCode() + "\n" + res.getContentText().slice(0, 500);
+  Logger.log(out);
+  return out;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ONE-TIME SETUP
+//  Run initialSetup() ONCE from the Apps Script editor
+//  (select it in the toolbar dropdown → Run → approve permissions).
+//  Safe to re-run: it only adds what's missing, never deletes data.
+// ═══════════════════════════════════════════════════════════
+
+// Canonical header order. MUST match the frontend `fields` array + "S.no".
+const CANONICAL_HEADERS = [
+  "S.no","Position ID","Role","Candidate Status","Candidate Name","Current Company","Contact No","Mail Id",
+  "Designation","Department","Interview Date","Offered Date","Date of Joining","CTC",
+  "variable","Source","Offer Acceptance","Remarks","Resume","AI Score","Score Notes",
+  "Tagged Job","Rating10","Stars","Profile JSON"
+];
+
+const JOB_HEADERS = [
+  "Job ID","Job Title","Department","Hiring Manager","HM Email","HOD","HOD Email",
+  "Location","Status","Posted Date","JD"
+];
+
+function initialSetup() {
+  const logs = [];
+  logs.push(setupCandidateSheet());
+  logs.push(setupJobsSheet());
+  logs.push(setupAuthSheet());
+  const summary = logs.join("\n");
+  Logger.log(summary);
+  return summary; // visible in the execution log
+}
+
+/** Generic "create tab with headers, else append missing" used by both operational tabs. */
+function ensureSheet(name, headers) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    formatHeader(sheet, headers.length);
+    return "✔ Created '" + name + "' tab with " + headers.length + " columns.";
+  }
+  const existing = sheet.getRange(1, 1, 1, Math.max(1, sheet.getLastColumn())).getValues()[0].map(h => h.toString().trim());
+  const missing = headers.filter(h => existing.indexOf(h) === -1
+                                   && !(h === "Position ID" && existing.indexOf("Position ID.") !== -1));
+  if (missing.length) {
+    sheet.getRange(1, sheet.getLastColumn() + 1, 1, missing.length).setValues([missing]);
+    formatHeader(sheet, sheet.getLastColumn());
+    return "✔ '" + name + "' tab existed — added missing columns: " + missing.join(", ");
+  }
+  return "✔ '" + name + "' tab already complete — no changes.";
+}
+
+function setupCandidateSheet() { return ensureSheet("Candidate", CANONICAL_HEADERS); }
+function setupJobsSheet()      { return ensureSheet("Jobs", JOB_HEADERS); }
+
+/** Creates/repairs the "Auth" tab in the SEPARATE auth spreadsheet (by AUTH_SHEET_ID). */
+function setupAuthSheet() {
+  if (!AUTH_SHEET_ID || AUTH_SHEET_ID.indexOf("PASTE") === 0) {
+    return "⚠ Skipped Auth setup — set AUTH_SHEET_ID in CONFIG first, then re-run initialSetup().";
+  }
+  let authSS;
+  try { authSS = SpreadsheetApp.openById(AUTH_SHEET_ID); }
+  catch (e) { return "✘ Could not open Auth spreadsheet. Check AUTH_SHEET_ID and that it's shared with this account."; }
+
+  let auth = authSS.getSheetByName(AUTH_TAB_NAME);
+  if (!auth) {
+    auth = authSS.insertSheet(AUTH_TAB_NAME);
+    auth.getRange(1, 1, 1, 3).setValues([["Username", "Password", "Role"]]);
+    auth.getRange(2, 1, 1, 3).setValues([["admin", "admin123", "Admin"]]); // CHANGE THIS immediately
+    formatHeader(auth, 3);
+    return "✔ Created '" + AUTH_TAB_NAME + "' tab with a sample admin login (admin / admin123). CHANGE IT NOW.";
+  }
+  // Ensure a Role column (col C) exists.
+  const hdr = auth.getRange(1, 1, 1, Math.max(3, auth.getLastColumn())).getValues()[0];
+  if (!hdr[2]) auth.getRange(1, 3).setValue("Role");
+  return "✔ '" + AUTH_TAB_NAME + "' tab already present — left intact.";
+}
+
+function formatHeader(sheet, cols) {
+  const h = sheet.getRange(1, 1, 1, cols);
+  h.setFontWeight("bold").setFontColor("#ffffff").setBackground("#0d1426");
+  sheet.setFrozenRows(1);
+}
